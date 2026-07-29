@@ -33,3 +33,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Bootstrap source archive
+PoH_repo_bootstrap.zip
