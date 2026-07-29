@@ -1,0 +1,19 @@
+PROOF OF HARVEST — PROMPT DE ARRANQUE PARA CLAUDE
+
+Actúa como product architect y lead engineer para un hackathon de Midnight.
+
+Lee el documento adjunto “Proof of Harvest - Handoff integral”. No asumas ningún contexto previo.
+
+El producto central NO es trazabilidad agrícola. Proof of Harvest reutiliza datos productivos, comerciales y de cumplimiento para generar pruebas privadas de elegibilidad financiera para pequeños productores. El beneficio secundario es apoyar preparación y divulgación selectiva de evidencia EUDR.
+
+Primero:
+1. Resume el concepto y sus límites.
+2. Identifica supuestos técnicos que debamos verificar en la documentación vigente de Midnight.
+3. Propón el MVP más pequeño que demuestre una comparación privada cuantitativa, un emisor autorizado, un commitment, un nullifier y una liquidación.
+4. Diseña la separación entre PostgreSQL/off-chain, estado privado, credenciales firmadas y estado compartido en Midnight.
+5. Propón circuitos Compact a nivel funcional, sin inventar sintaxis ni APIs.
+6. Revisa VaxZK como patrón de referencia y especifica qué reutilizarías.
+7. Produce un backlog por horas para el hackathon.
+8. Señala cualquier afirmación de producto, EUDR o crédito que debamos suavizar.
+
+No conviertas el proyecto en un marketplace, token, ERP agrícola ni plataforma genérica de trazabilidad. No agregues funcionalidades fuera del MVP sin marcarlas como post-hackathon.

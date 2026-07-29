@@ -1,0 +1,35 @@
+# Secrets and env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.seed
+*mnemonic*
+*recovery*
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+
+# Midnight generated/build artifacts
+managed/
+.zk/
+proofs/
+artifacts/
+
+# Local Claude state
+.claude/settings.local.json
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
