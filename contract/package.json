@@ -1,0 +1,21 @@
+{
+  "name": "@poh/contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "compile": "compact compile --skip-zk src/ProofOfHarvest.compact src/managed/ProofOfHarvest",
+    "compile:zk": "compact compile src/ProofOfHarvest.compact src/managed/ProofOfHarvest",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "0.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

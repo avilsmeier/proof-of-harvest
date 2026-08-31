@@ -1,0 +1,576 @@
+// Proof of Harvest — private agricultural campaign-finance eligibility.
+//
+// What this contract does:
+//   A producer holds a private, issuer-signed productive credential. This
+//   contract lets them prove to a financier that the credential satisfies a
+//   versioned financing policy — including a quantitative capacity ratio —
+//   without publishing the underlying production, capacity, certification or
+//   supplier data, and registers a campaign commitment so the same harvest
+//   cannot be financed twice inside the participating network.
+//
+// What this contract does NOT do (see docs/HANDOFF.md sections 8 and 15):
+//   It does not prove that the credential's contents are true about the
+//   physical world. It proves that a registered, active issuer signed them and
+//   that the signed values satisfy the policy. Physical-world assurance comes
+//   from issuer accountability, inspections and audit — not from this proof.
+//   It does not certify EUDR compliance, replace KYC, or detect financing
+//   commitments made outside this contract.
+//
+// Public (ledger) state holds only: the registry admin identity, the versioned
+// policy and its hash, the authorized-issuer registry, campaign commitment
+// nullifiers with their settlement status, and EUDR evidence attestations.
+// No producer identity, coordinates, volumes, prices or margins ever reach it.
+
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+import "./schnorr" prefix Schnorr_;
+
+export { Schnorr_SchnorrSignature };
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+// `unknown` is the first variant so that a zero-valued credential can never
+// accidentally read as `pass`.
+export enum EvidenceStatus {
+  unknown,
+  fail,
+  pass
+}
+
+// `none` is the first variant so that a default-valued commitment can never
+// accidentally read as `reserved` or `settled`.
+export enum CommitmentStatus {
+  none,
+  reserved,
+  settled
+}
+
+// The financing policy. Sealed at deployment: one hardcoded, versioned policy
+// per contract instance for the MVP. `supplierSetHash` anchors the authorized
+// supplier list on-chain without publishing the list itself, so changing the
+// authorized suppliers means publishing a new policy version.
+export struct FinancingPolicy {
+  policyId: Bytes<32>;
+  version: Uint<32>;
+  minimumCampaigns: Uint<16>;
+  maxRatioNumerator: Uint<16>;
+  ratioDenominator: Uint<16>;
+  supplierSetHash: Bytes<32>;
+}
+
+export struct IssuerRecord {
+  pubKey: JubjubPoint;
+  active: Boolean;
+}
+
+// The private productive credential. Never appears in public state; the issuer
+// signs it off-chain and the producer supplies it as a witness.
+//
+// `producerSecretId` is the producer's private identifier. It is the only
+// entropy binding the campaign nullifier to the producer, so it must be secret
+// and high-entropy: anyone who learns it can compute the producer's nullifiers
+// and link their campaigns.
+//
+// The credential is bearer-style: nothing binds it to the holder, because the
+// circuit never consults `localSecretKey` when proving eligibility. Whoever
+// holds the credential bytes can prove with them, so credential
+// confidentiality is what stops a third party reserving a producer's campaign.
+// Binding the credential to a producer-held key is the hardening step; it is
+// out of scope for the MVP because the demo has a single producer wallet.
+export struct CampaignCredential {
+  producerSecretId: Bytes<32>;
+  campaignId: Bytes<32>;
+  supplierId: Bytes<32>;
+  campaignCount: Uint<16>;
+  estimatedSettlementValue: Uint<64>;
+  certificationExpiry: Uint<64>;
+  credentialExpiry: Uint<64>;
+  plotOriginStatus: EvidenceStatus;
+  traceabilityStatus: EvidenceStatus;
+  activeCommitment: Boolean;
+}
+
+// The public record of a registered campaign commitment. Deliberately contains
+// no private credential value: `requesterId`, `requestedValue` and `provenAt`
+// are all public circuit parameters.
+//
+// Those three are *unauthenticated*. They are supplied by whoever builds the
+// transaction, so `requesterId` records who the prover says is asking, not a
+// verified financier identity. The financier's own guarantee comes from
+// checking that the recorded values match the request they issued. Binding a
+// financier signature over the request is the hardening step.
+export struct CampaignCommitment {
+  status: CommitmentStatus;
+  policyVersion: Uint<32>;
+  requesterId: Bytes<32>;
+  issuerId: Bytes<32>;
+  requestedValue: Uint<64>;
+  provenAt: Uint<64>;
+}
+
+export struct EudrEvidenceResult {
+  policyVersion: Uint<32>;
+  issuerId: Bytes<32>;
+  buyerId: Bytes<32>;
+  provenAt: Uint<64>;
+}
+
+// ---------------------------------------------------------------------------
+// Ledger (public shared state)
+// ---------------------------------------------------------------------------
+
+// Registry admin, stored as a hash-derived identity rather than a public key.
+// Derived from a private witness secret, never from `ownPublicKey()`, which
+// returns a prover-claimed value with no binding to the transaction signer.
+export sealed ledger admin: Bytes<32>;
+
+export sealed ledger policy: FinancingPolicy;
+
+export sealed ledger policyHash: Bytes<32>;
+
+// issuerId -> issuer signing key + revocation flag.
+export ledger issuers: Map<Bytes<32>, IssuerRecord>;
+
+// Campaign nullifier -> commitment. Membership is the reservation: inserting a
+// nullifier is what makes a second request against the same campaign fail.
+// A single map (rather than a separate Set plus a settled-flag Map) makes it
+// impossible for registration and settlement state to disagree.
+export ledger commitments: Map<Bytes<32>, CampaignCommitment>;
+
+// EUDR evidence reference -> attestation. Keyed under a different domain
+// separator from the campaign nullifier, so an observer cannot link a buyer's
+// EUDR attestation to the producer's financing commitment.
+export ledger eudrAttestations: Map<Bytes<32>, EudrEvidenceResult>;
+
+// ---------------------------------------------------------------------------
+// Witnesses (private, prover-local)
+// ---------------------------------------------------------------------------
+
+// The registry admin's / issuer operator's local secret. Identity is derived
+// from this in-circuit; the secret itself never leaves the prover.
+witness localSecretKey(): Bytes<32>;
+
+// The producer's signed productive credential: the credential itself, the
+// issuer's Schnorr signature over it, and the claimed issuer id.
+witness campaignCredential(): [CampaignCredential, Schnorr_SchnorrSignature, Bytes<32>];
+
+// The issuer's Schnorr signature authorizing settlement of a campaign, and the
+// claimed issuer id.
+witness settlementAttestation(): [Schnorr_SchnorrSignature, Bytes<32>];
+
+// The authorized supplier list backing `policy.supplierSetHash`. Supplied
+// privately so that membership can be proven without revealing which supplier
+// the producer used.
+witness authorizedSupplierList(): Vector<8, Bytes<32>>;
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+
+constructor(initialPolicy: FinancingPolicy) {
+  // The policy is public by design — the whole point is that a financier can
+  // read which rules were applied. `disclose` here acknowledges that circuit
+  // parameters are prover-supplied as far as the compiler is concerned.
+  const publicPolicy = disclose(initialPolicy);
+  admin = disclose(deriveAdminId(localSecretKey()));
+  policy = publicPolicy;
+  policyHash = persistentHash<FinancingPolicy>(publicPolicy);
+}
+
+// ---------------------------------------------------------------------------
+// Identity and message helpers
+// ---------------------------------------------------------------------------
+
+export pure circuit deriveAdminId(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "poh:admin:v1"), sk]);
+}
+
+circuit assertAdmin(): [] {
+  assert(admin == deriveAdminId(localSecretKey()), "PoH: caller is not the registry admin");
+}
+
+// The message an issuer signs to attest a productive credential.
+//
+// Exported so the off-chain issuer signing helper can reconstruct the exact
+// message the circuit will verify, using the same compiled primitives.
+// The leading domain tag keeps credential signatures from being replayable as
+// settlement signatures and vice versa.
+export pure circuit credentialMessage(
+                      credential: CampaignCredential,
+                      boundPolicyHash: Bytes<32>
+                      ): Vector<3, Field> {
+  return [degradeToTransient(pad(32, "poh:credential:v1")),
+          degradeToTransient(persistentHash<CampaignCredential>(credential)),
+          degradeToTransient(boundPolicyHash)];
+}
+
+// The message an issuer signs to authorize settlement of a campaign.
+export pure circuit settlementMessage(
+                      nullifier: Bytes<32>,
+                      boundPolicyHash: Bytes<32>
+                      ): Vector<3, Field> {
+  return [degradeToTransient(pad(32, "poh:settlement:v1")),
+          degradeToTransient(nullifier),
+          degradeToTransient(boundPolicyHash)];
+}
+
+// Campaign nullifier. Bound to the policy *program* id and not to the policy
+// *version*: a campaign must be financeable only once across the whole
+// program, otherwise bumping the policy version would reopen an already
+// committed harvest for a second financing.
+export pure circuit campaignNullifier(
+                      policyId: Bytes<32>,
+                      producerSecretId: Bytes<32>,
+                      campaignId: Bytes<32>
+                      ): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+           [pad(32, "poh:campaign-nullifier:v1"), policyId, producerSecretId, campaignId]
+           );
+}
+
+// EUDR evidence reference.
+//
+// Derived from the same producer and campaign as the campaign nullifier but
+// under a different domain separator, so the two *keys* are cryptographically
+// unlinkable to anyone who does not already hold `producerSecretId`. Note the
+// records themselves still share `issuerId` and `provenAt`, so a producer who
+// runs both proofs on the same date under the same issuer is correlatable by
+// that metadata — the unlinkability claim covers the keys, not the metadata.
+//
+// `buyerId` is part of the derivation so each buyer gets its own reference.
+// Without it, a second buyer's proof would overwrite the first buyer's
+// attestation in place.
+export pure circuit eudrEvidenceRef(
+                      policyId: Bytes<32>,
+                      producerSecretId: Bytes<32>,
+                      campaignId: Bytes<32>,
+                      buyerId: Bytes<32>
+                      ): Bytes<32> {
+  return persistentHash<Vector<5, Bytes<32>>>(
+           [pad(32, "poh:eudr-evidence:v1"), policyId, producerSecretId, campaignId, buyerId]
+           );
+}
+
+// ---------------------------------------------------------------------------
+// Off-chain signing support
+// ---------------------------------------------------------------------------
+//
+// These two pure circuits exist so the issuer's off-chain signer can build a
+// signature using the *same* compiled Jubjub and hash primitives the circuit
+// verifies with, rather than a re-implementation in TypeScript that could
+// disagree on curve parameters or hash encoding. They are exposed to
+// TypeScript via `pureCircuits`. Neither touches ledger or witness state.
+
+// Jubjub scalar multiplication of the generator. Used off-chain twice: to
+// derive an issuer's public key from its secret scalar, and to derive a
+// signature's announcement point from a per-signature nonce.
+export pure circuit deriveIssuerPublicKey(sk: Field): JubjubPoint {
+  return ecMulGenerator(sk);
+}
+
+// The digest that `policy.supplierSetHash` must hold. Exposed so whoever
+// publishes a policy version computes the digest with the same primitive the
+// circuit checks against.
+export pure circuit supplierSetDigest(suppliers: Vector<8, Bytes<32>>): Bytes<32> {
+  return persistentHash<Vector<8, Bytes<32>>>(suppliers);
+}
+
+// The deterministic challenge truncation `schnorrVerify` applies. Re-exported
+// so off-chain signers and tests can confirm they reduce the challenge exactly
+// as the circuit does, rather than assuming it.
+export pure circuit schnorrTruncateChallenge(challengeHash: Field): Field {
+  return Schnorr_schnorrTruncateChallenge(challengeHash);
+}
+
+// The untruncated Schnorr challenge for a 3-element message, matching the
+// arity used by `credentialMessage` and `settlementMessage`. The off-chain
+// signer reduces this modulo 2^248 exactly as `schnorrVerify` does.
+export pure circuit schnorrChallenge3(
+                      annX: Field,
+                      annY: Field,
+                      pkX: Field,
+                      pkY: Field,
+                      msg: Vector<3, Field>
+                      ): Field {
+  return Schnorr_schnorrChallenge<3>(annX, annY, pkX, pkY, msg);
+}
+
+// ---------------------------------------------------------------------------
+// Internal checks
+// ---------------------------------------------------------------------------
+
+// Verifies the credential was signed by a registered, active issuer and
+// returns that issuer's public id.
+//
+// The issuer id is disclosed: the registry lookup is a public ledger read, and
+// HANDOFF section 6.4 wants "who issued each piece of evidence" to be shared
+// state. This does link a request to an exporter — see the privacy notes in
+// the project README.
+circuit verifyIssuedCredential(
+          credential: CampaignCredential,
+          signature: Schnorr_SchnorrSignature,
+          issuerId: Bytes<32>
+          ): Bytes<32> {
+  const publicIssuerId = disclose(issuerId);
+  assert(issuers.member(publicIssuerId), "PoH: issuer is not registered");
+  const issuer = issuers.lookup(publicIssuerId);
+  assert(issuer.active, "PoH: issuer has been revoked");
+  Schnorr_schnorrVerify<3>(credentialMessage(credential, policyHash), signature, issuer.pubKey);
+  return publicIssuerId;
+}
+
+// Proves `supplierId` is in the policy's authorized supplier list without
+// revealing which entry matched. The witness supplies the list; hashing it
+// in-circuit and comparing against the on-chain `policy.supplierSetHash`
+// stops the prover from substituting a list of their own.
+circuit supplierIsAuthorized(supplierId: Bytes<32>): Boolean {
+  // A policy with fewer than eight authorized suppliers pads the remaining
+  // slots with all-zero entries, so an all-zero `supplierId` would otherwise
+  // match the padding and pass. That is exactly what a default-initialized
+  // credential or a buggy issuer backend produces, so reject it up front —
+  // the same reasoning that makes `unknown` the zero value of EvidenceStatus.
+  assert(supplierId != default<Bytes<32>>, "PoH: supplier is not authorized");
+  const suppliers = authorizedSupplierList();
+  assert(supplierSetDigest(suppliers) == policy.supplierSetHash,
+         "PoH: supplier list does not match the policy's authorized supplier set"
+         );
+  return fold((found: Boolean, candidate: Bytes<32>): Boolean => found || (candidate == supplierId),
+              false,
+              suppliers);
+}
+
+// ---------------------------------------------------------------------------
+// Issuer registry (admin only)
+// ---------------------------------------------------------------------------
+
+// The issuer registry is public shared state by design (HANDOFF section 6.4),
+// so both parameters are disclosed.
+// Rejects issuer signing keys that would make signature verification vacuous.
+//
+// `schnorrVerify` checks `response * G == announcement + c * pubKey`. If
+// `pubKey` is the curve identity then `c * pubKey` is the identity for every
+// challenge, the equation collapses to `response * G == announcement`, and
+// anyone satisfies it by picking a nonce `k` and setting `response = k` — no
+// secret key involved. Verified against this contract: registering the identity
+// made every credential forgeable by anyone.
+//
+// The identity is the only on-curve point with x == 0 that the runtime accepts
+// (it rejects the order-2 point and off-curve points outright), so the x check
+// catches it. The subgroup check additionally excludes any small-order torsion
+// component, which would let an attacker guess the challenge contribution with
+// probability 1/4 or 1/8. Both run only on the admin path, so their cost is
+// paid once per issuer rather than once per proof.
+//
+// Note the identity passes the subgroup test trivially — it is a member of every
+// subgroup — so both assertions are required.
+circuit assertUsableIssuerKey(pubKey: JubjubPoint): [] {
+  assert(jubjubPointX(pubKey) != 0, "PoH: degenerate issuer public key");
+  // P is in the prime-order subgroup iff L*P == identity iff (L-1)*P == -P,
+  // and on a twisted Edwards curve -P == (-x, y). L-1 is used because `ecMul`
+  // requires a scalar strictly below L.
+  const lMinusOne: Field =
+          6554484396890773809930967563523245729705921265872317281365359162392183254198 as Field;
+  const scaled = ecMul(pubKey, lMinusOne);
+  assert(jubjubPointX(scaled) == (0 - jubjubPointX(pubKey)) &&
+         jubjubPointY(scaled) == jubjubPointY(pubKey),
+         "PoH: issuer public key is not in the prime-order subgroup"
+         );
+}
+
+export circuit registerIssuer(issuerId: Bytes<32>, pubKey: JubjubPoint): [] {
+  assertAdmin();
+  const publicPubKey = disclose(pubKey);
+  assertUsableIssuerKey(publicPubKey);
+  assert(disclose(issuerId) != default<Bytes<32>>, "PoH: issuer id must not be empty");
+  issuers.insert(disclose(issuerId), IssuerRecord { pubKey: publicPubKey, active: true });
+}
+
+export circuit revokeIssuer(issuerId: Bytes<32>): [] {
+  assertAdmin();
+  const publicIssuerId = disclose(issuerId);
+  assert(issuers.member(publicIssuerId), "PoH: issuer is not registered");
+  const existing = issuers.lookup(publicIssuerId);
+  issuers.insert(publicIssuerId, IssuerRecord { pubKey: existing.pubKey, active: false });
+}
+
+// ---------------------------------------------------------------------------
+// Core proof: private campaign-finance eligibility
+// ---------------------------------------------------------------------------
+
+// Proves the producer's private credential satisfies the policy, then reserves
+// the campaign commitment. Reservation is part of this circuit rather than a
+// separate call so that an eligibility proof and the commitment it depends on
+// cannot drift apart between transactions.
+//
+// Public inputs, recorded on-chain and unauthenticated (see CampaignCommitment):
+//   requesterId    — who the request is attributed to
+//   requestedValue — the campaign support being asked for
+//   asOfDate       — the date the policy is evaluated against, in Unix seconds
+//
+// `asOfDate` is bound to the chain clock so it cannot be post-dated. It can
+// still be back-dated, which would make an expired certification look current
+// — but `asOfDate` is public and recorded in the commitment, so a stale date
+// is visible to the financier verifying the result.
+//
+// Returns the campaign nullifier.
+export circuit proveCampaignEligibility(
+                 requesterId: Bytes<32>,
+                 requestedValue: Uint<64>,
+                 asOfDate: Uint<64>
+                 ): Bytes<32> {
+  // These three are the financier's own public request parameters and are
+  // recorded on-chain so the result is independently checkable.
+  const publicRequesterId = disclose(requesterId);
+  const publicRequestedValue = disclose(requestedValue);
+  const publicAsOfDate = disclose(asOfDate);
+
+  assert(publicRequestedValue > 0, "PoH: requested value must be positive");
+  assert(blockTimeGte(publicAsOfDate), "PoH: as-of date must not be in the future");
+
+  const [credential, signature, issuerId] = campaignCredential();
+  const publicIssuerId = verifyIssuedCredential(credential, signature, issuerId);
+
+  // --- The policy. Every comparison below is over private, signed values. ---
+
+  assert(credential.campaignCount >= policy.minimumCampaigns, "PoH: insufficient campaign history");
+
+  // The private quantitative comparison this MVP hinges on:
+  //   requestedValue / estimatedSettlementValue <= maxRatioNumerator / ratioDenominator
+  // rearranged into integer multiplication because Compact has no division.
+  // `estimatedSettlementValue` is never disclosed; the financier learns only
+  // that the requested amount fits inside the policy's ratio of it.
+  assert(publicRequestedValue * policy.ratioDenominator <=
+         credential.estimatedSettlementValue * policy.maxRatioNumerator,
+         "PoH: requested value exceeds the policy ratio of estimated settlement"
+         );
+
+  assert(credential.certificationExpiry >= publicAsOfDate, "PoH: certification is not current");
+  assert(credential.credentialExpiry >= publicAsOfDate, "PoH: credential has expired");
+  assert(credential.plotOriginStatus == EvidenceStatus.pass,
+         "PoH: plot origin policy not satisfied"
+         );
+  // This is the issuer's attestation, at issuance time, that the producer had
+  // no other campaign account open. It is a snapshot, not live state: the
+  // contract keeps no per-producer commitment index, so it cannot detect a
+  // second open commitment created after the credential was signed. The
+  // enforceable, ongoing guarantee is per-campaign, via the nullifier below.
+  assert(!credential.activeCommitment,
+         "PoH: issuer attested an active campaign commitment for this producer"
+         );
+  assert(supplierIsAuthorized(credential.supplierId), "PoH: supplier is not authorized");
+
+  // --- Reserve the campaign commitment. ---
+
+  const nullifier =
+          disclose(campaignNullifier(
+                     policy.policyId,
+                     credential.producerSecretId,
+                     credential.campaignId
+                     ));
+  assert(!commitments.member(nullifier), "PoH: this campaign already has a registered commitment");
+  commitments.insert(
+    nullifier,
+    CampaignCommitment { status: CommitmentStatus.reserved,
+                         policyVersion: policy.version,
+                         requesterId: publicRequesterId,
+                         issuerId: publicIssuerId,
+                         requestedValue: publicRequestedValue,
+                         provenAt: publicAsOfDate }
+    );
+  return nullifier;
+}
+
+// ---------------------------------------------------------------------------
+// Settlement
+// ---------------------------------------------------------------------------
+
+// Closes an open commitment. Authorization is a Schnorr signature from the
+// same issuer that attested the credential, over a settlement-domain message
+// naming the nullifier — so only the issuing organization can close it, and
+// only for that specific campaign.
+export circuit settleCampaign(nullifier: Bytes<32>): [] {
+  // The nullifier is already public state — it was published when the
+  // commitment was reserved.
+  const publicNullifier = disclose(nullifier);
+  assert(commitments.member(publicNullifier), "PoH: no registered commitment for this campaign");
+  const commitment = commitments.lookup(publicNullifier);
+  assert(commitment.status == CommitmentStatus.reserved,
+         "PoH: commitment is not open for settlement"
+         );
+
+  const [signature, issuerId] = settlementAttestation();
+  const publicIssuerId = disclose(issuerId);
+  assert(publicIssuerId == commitment.issuerId,
+         "PoH: settlement must be attested by the issuing organization"
+         );
+  assert(issuers.member(publicIssuerId), "PoH: issuer is not registered");
+  const issuer = issuers.lookup(publicIssuerId);
+  assert(issuer.active, "PoH: issuer has been revoked");
+  Schnorr_schnorrVerify<3>(settlementMessage(publicNullifier, policyHash), signature, issuer.pubKey);
+
+  commitments.insert(
+    publicNullifier,
+    CampaignCommitment { status: CommitmentStatus.settled,
+                         policyVersion: commitment.policyVersion,
+                         requesterId: commitment.requesterId,
+                         issuerId: commitment.issuerId,
+                         requestedValue: commitment.requestedValue,
+                         provenAt: commitment.provenAt }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Secondary proof: EUDR-oriented evidence reuse
+// ---------------------------------------------------------------------------
+
+// Re-uses the *same* issuer-signed credential to answer a buyer's origin and
+// traceability question, and reads none of its financial fields — no capacity,
+// no campaign history, no supplier, no requested value. This is the evidence
+// reuse the product thesis rests on: one signed credential, two unrelated
+// policies, no financial disclosure to the buyer.
+//
+// This attests that authorized issuers signed origin and traceability
+// evidence. It is not an EUDR compliance certification and does not replace
+// the geolocation and due-diligence disclosure the regulation requires.
+//
+// `certificationExpiry` is deliberately not checked here. That field tracks a
+// commercial certification such as organic or fair-trade, which is what the
+// financing policy cares about; EUDR asks about deforestation and legality of
+// production, which `plotOriginStatus` and `traceabilityStatus` carry. Only
+// `credentialExpiry` gates staleness of the evidence itself.
+export circuit proveEudrEvidence(buyerId: Bytes<32>, asOfDate: Uint<64>): Bytes<32> {
+  const publicBuyerId = disclose(buyerId);
+  const publicAsOfDate = disclose(asOfDate);
+  assert(blockTimeGte(publicAsOfDate), "PoH: as-of date must not be in the future");
+
+  const [credential, signature, issuerId] = campaignCredential();
+  const publicIssuerId = verifyIssuedCredential(credential, signature, issuerId);
+
+  assert(credential.credentialExpiry >= publicAsOfDate, "PoH: credential has expired");
+  assert(credential.plotOriginStatus == EvidenceStatus.pass,
+         "PoH: plot origin policy not satisfied"
+         );
+  assert(credential.traceabilityStatus == EvidenceStatus.pass,
+         "PoH: traceability evidence is incomplete"
+         );
+
+  const evidenceRef =
+          disclose(eudrEvidenceRef(
+                     policy.policyId,
+                     credential.producerSecretId,
+                     credential.campaignId,
+                     publicBuyerId
+                     ));
+  eudrAttestations.insert(
+    evidenceRef,
+    EudrEvidenceResult { policyVersion: policy.version,
+                         issuerId: publicIssuerId,
+                         buyerId: publicBuyerId,
+                         provenAt: publicAsOfDate }
+    );
+  return evidenceRef;
+}

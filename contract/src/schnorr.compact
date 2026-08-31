@@ -1,0 +1,105 @@
+// Schnorr signature verification polyfill for the Jubjub curve.
+//
+// Adapted from the midnight-expert `modules/crypto/schnorr.compact` reference
+// (Apache-2.0, midnightntwrk/example-counter lineage). Expected to be replaced
+// by `jubjubSchnorrVerify` once that lands in CompactStandardLibrary.
+//
+// TWO CHANGES VS. UPSTREAM.
+//
+// 1. `schnorrChallenge` is generic over the message length `#n` rather than
+//    pinned to `Vector<4, Field>`, so callers choose their own message arity.
+//
+// 2. SECURITY FIX — the challenge truncation no longer goes through a witness.
+//
+//    Upstream asked a `getSchnorrReduction` witness for the quotient and
+//    remainder of `challengeHash / 2^248` and asserted
+//    `q * 2^248 + r == challengeHash` with `r : Uint<248>`. That constraint is
+//    NOT binding: `q` was typed `Field`, so it ranges over the whole
+//    BLS12-381 scalar field, and the assertion is field arithmetic mod p.
+//    A prover wanting any particular `r < 2^248` simply solves
+//    `q = (challengeHash - r) * inv(2^248) mod p`, which always exists because
+//    p is prime. Bounding `r` to 248 bits proves `r` is *in range*, never that
+//    it is the *correct* reduction of the challenge.
+//
+//    The consequence was universal forgery: given one honest signature from an
+//    issuer, a prover replays it against any message by pinning `r` to the
+//    original challenge and choosing `q` to absorb the new hash. Verified
+//    against this contract — a credential claiming 999,999,999 of settlement
+//    capacity was accepted using only the issuer's signature over a genuine
+//    9,000 credential, with no issuer secret involved.
+//
+//    The fix removes the prover from the reduction entirely. `degradeToTransient`
+//    truncates a `Bytes<32>` to its low 248 bits, and `upgradeFromTransient`
+//    encodes a `Field` as `Bytes<32>`, so composing them computes
+//    `challengeHash mod 2^248` as a deterministic in-circuit function with no
+//    witness input and nothing to forge. (Identity verified empirically across
+//    the field's range, including 0, 2^248 boundaries and p-1.)
+//
+//    Truncating to 248 bits is still required: `ecMul` needs a scalar below the
+//    Jubjub subgroup order (~2^252.03), while `transientHash` returns a value in
+//    BLS12-381's scalar field (~2^255). 248 bits leaves 124-bit collision
+//    resistance on the challenge, which is the security level of the curve.
+//
+//    Off-chain signers MUST apply the identical truncation when computing the
+//    challenge, or the verification equation will not close.
+
+pragma language_version >= 0.23;
+
+module schnorr {
+  import CompactStandardLibrary;
+
+  export struct SchnorrSignature {
+    announcement: JubjubPoint;
+    response: Field;
+  }
+
+  struct SchnorrHashInput<#n> {
+    ann_x: Field;
+    ann_y: Field;
+    pk_x: Field;
+    pk_y: Field;
+    msg: Vector<n, Field>;
+  }
+
+  // Deterministic truncation of a challenge hash to its low 248 bits. No
+  // witness, no prover input, no assertion to satisfy — the value is a pure
+  // function of the input, so there is no reduction for a prover to choose.
+  export pure circuit schnorrTruncateChallenge(challengeHash: Field): Field {
+    return degradeToTransient(upgradeFromTransient(challengeHash));
+  }
+
+  export pure circuit schnorrChallenge<#n>(
+                        ann_x: Field,
+                        ann_y: Field,
+                        pk_x: Field,
+                        pk_y: Field,
+                        msg: Vector<n, Field>
+                        ): Field {
+    return transientHash<SchnorrHashInput<n>>(
+             SchnorrHashInput<n> { ann_x: ann_x, ann_y: ann_y, pk_x: pk_x, pk_y: pk_y, msg: msg }
+             );
+  }
+
+  export circuit schnorrVerify<#n>(
+                   msg: Vector<n, Field>,
+                   signature: SchnorrSignature,
+                   pk: JubjubPoint
+                   ): [] {
+    const {announcement, response} = signature;
+    const cFull: Field =
+            schnorrChallenge<n>(
+              jubjubPointX(announcement),
+              jubjubPointY(announcement),
+              jubjubPointX(pk),
+              jubjubPointY(pk),
+              msg
+              );
+    const c: Field = schnorrTruncateChallenge(cFull);
+    // response * G == announcement + c * pk
+    const lhs: JubjubPoint = ecMulGenerator(response);
+    const rhs: JubjubPoint = ecAdd(announcement, ecMul(pk, c));
+    assert(jubjubPointX(lhs) == jubjubPointX(rhs) && jubjubPointY(lhs) == jubjubPointY(rhs),
+           "PoH: invalid issuer signature"
+           );
+  }
+}

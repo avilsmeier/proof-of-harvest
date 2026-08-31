@@ -1,0 +1,10 @@
+{
+  "name": "proof-of-harvest",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "contract",
+    "app/ui",
+    "app/api"
+  ]
+}

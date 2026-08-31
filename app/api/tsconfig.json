@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  // `src` is this package's own code. `../../contract/src` is included too:
+  // the contract package ships no build step of its own (see
+  // contract-bindings.ts), so witnesses.ts/issuer.ts/the managed compiled
+  // output are consumed as source, not as a published dependency — tsc
+  // needs them in the program's file list to type-check across that
+  // boundary. `rootDir` is intentionally left unset (TS infers the lowest
+  // common ancestor) rather than pinned to `src`, which would reject any
+  // file outside it.
+  "include": ["src", "../../contract/src"],
+  "exclude": ["node_modules", "dist", "../../contract/src/test"]
+}

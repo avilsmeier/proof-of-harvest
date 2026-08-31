@@ -21,6 +21,12 @@ managed/
 proofs/
 artifacts/
 
+# ZK assets copied into the UI's static/public dir for the browser proof
+# provider to fetch (regenerate with `npm run copy-contract-keys` in app/ui)
+app/ui/public/keys/
+app/ui/public/zkir/
+app/ui/public/managed/
+
 # Local Claude state
 .claude/settings.local.json
 
